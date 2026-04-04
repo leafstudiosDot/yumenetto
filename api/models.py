@@ -1,5 +1,7 @@
 from django.db import models
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
+from django.core.exceptions import ValidationError
+from django.core.validators import RegexValidator
 import hashlib
 import uuid
 
@@ -92,3 +94,49 @@ class User(AbstractBaseUser, PermissionsMixin):
             self.ROLE_ADMIN,
             self.ROLE_MODERATOR,
         }
+
+    def can_create_communities(self):
+        return self.role in {
+            self.ROLE_SUPERUSER,
+            self.ROLE_ADMIN,
+        }
+    
+    def can_delete_communities(self):
+        return self.role in {
+            self.ROLE_SUPERUSER,
+        }
+
+class Community(models.Model):
+    name_validator = RegexValidator(
+        regex=r'^[a-z0-9_]{2,32}$',
+        message='Community name must be 2-32 chars: lowercase letters, numbers, underscore.',
+    )
+
+    public_id = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
+    title = models.CharField(max_length=120)
+    name = models.CharField(max_length=32, unique=True, validators=[name_validator])
+    description = models.TextField(blank=True)
+    created_by = models.ForeignKey(
+        User,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='created_communities',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    last_activity = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def clean(self):
+        if self.created_by and not self.created_by.can_create_communities():
+            raise ValidationError('Only admin or superuser can create communities.')
+
+    def save(self, *args, **kwargs):
+        self.full_clean()
+        return super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"/{self.name} - {self.title}"
