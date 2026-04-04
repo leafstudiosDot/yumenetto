@@ -26,6 +26,6 @@ class ThreadAdmin(admin.ModelAdmin):
 
 @admin.register(Reply)
 class ReplyAdmin(admin.ModelAdmin):
-    list_display = ('thread', 'author', 'created_at', 'status')
+    list_display = ('thread', 'content', 'author', 'created_at', 'status')
     list_filter = ('created_at', 'status')
     search_fields = ('content',)

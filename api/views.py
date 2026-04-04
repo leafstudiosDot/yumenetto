@@ -1,7 +1,9 @@
-from .models import Community
+from .models import Community, Thread, Reply, STATUS_PUBLIC
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.db.models import Count, Q
+from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view
 from rest_framework.decorators import authentication_classes, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -102,3 +104,81 @@ def community_list(request):
         for c in communities
     ]
     return Response(data)
+
+
+@api_view(['GET'])
+def community_threads(request, name):
+    community = get_object_or_404(Community, name=name)
+    threads = (
+        Thread.objects
+        .filter(community=community, status=STATUS_PUBLIC, is_deleted=False)
+        .select_related('author')
+        .annotate(
+            reply_count=Count(
+                'replies',
+                filter=Q(replies__status=STATUS_PUBLIC, replies__is_deleted=False),
+            )
+        )
+        .order_by('-created_at')
+    )
+
+    return Response({
+        'community': {
+            'name': community.name,
+            'title': community.title,
+            'description': community.description,
+        },
+        'threads': [
+            {
+                'id': t.id,
+                'title': t.title,
+                'description': t.description,
+                'author': t.author.display_name if t.author else 'deleted-user',
+                'created_at': t.created_at,
+                'reply_count': t.reply_count,
+            }
+            for t in threads
+        ],
+    })
+
+
+@api_view(['GET'])
+def thread_detail(request, name, thread_id):
+    community = get_object_or_404(Community, name=name)
+    thread = get_object_or_404(
+        Thread.objects.select_related('author', 'community'),
+        id=thread_id,
+        community=community,
+        status=STATUS_PUBLIC,
+        is_deleted=False,
+    )
+
+    replies = (
+        Reply.objects
+        .filter(thread=thread, status=STATUS_PUBLIC, is_deleted=False)
+        .select_related('author')
+        .order_by('created_at')
+    )
+
+    return Response({
+        'community': {
+            'name': community.name,
+            'title': community.title,
+        },
+        'thread': {
+            'id': thread.id,
+            'title': thread.title,
+            'description': thread.description,
+            'author': thread.author.display_name if thread.author else 'deleted-user',
+            'created_at': thread.created_at,
+        },
+        'replies': [
+            {
+                'id': reply.id,
+                'content': reply.content,
+                'author': reply.author.display_name if reply.author else 'deleted-user',
+                'created_at': reply.created_at,
+            }
+            for reply in replies
+        ],
+    })
