@@ -1,4 +1,10 @@
+
 from django.contrib import admin
+
+# Set custom admin site titles
+admin.site.site_header = 'YumeNetto Admin'
+admin.site.site_title = 'YumeNetto'
+admin.site.index_title = 'YumeNetto Administration'
 
 from .models import Community
 from .models import Thread
