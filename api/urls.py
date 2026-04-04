@@ -9,4 +9,5 @@ urlpatterns = [
     path('whoami/', views.whoami, name='whoami'),
     path('auth/login/', ObtainJWTView.as_view(), name='jwt-login'),
     path('auth/register/', RegisterKeyView.as_view(), name='jwt-register'),
+    path('communities/', views.community_list, name='community-list'),
 ]

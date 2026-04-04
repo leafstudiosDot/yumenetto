@@ -1,4 +1,7 @@
+from .models import Community
+
 from django.conf import settings
+from django.contrib.auth import get_user_model
 from rest_framework.decorators import api_view
 from rest_framework.decorators import authentication_classes, permission_classes
 from rest_framework.permissions import IsAuthenticated
@@ -7,7 +10,6 @@ from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny
-from django.contrib.auth import get_user_model
 import secrets
 
 from .authentication import AccessKeyAuthentication
@@ -86,3 +88,17 @@ def whoami(request):
         'identity_mode': 'access-key-only',
         'pow_verified': True
     })
+
+@api_view(['GET'])
+def community_list(request):
+    communities = Community.objects.all().order_by('name')
+    data = [
+        {
+            'name': c.name,
+            'title': c.title,
+            'description': c.description,
+            'adult_content': c.adult_content,
+        }
+        for c in communities
+    ]
+    return Response(data)
