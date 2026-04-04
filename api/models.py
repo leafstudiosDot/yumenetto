@@ -2,6 +2,8 @@ from django.db import models
 from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
 from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
+from django.contrib.postgres.fields import ArrayField
+from django.db.models import JSONField
 import hashlib
 import uuid
 
@@ -114,18 +116,23 @@ class Community(models.Model):
 
     public_id = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
     title = models.CharField(max_length=120)
-    name = models.CharField(max_length=32, unique=True, validators=[name_validator])
+    name = models.CharField(max_length=32, unique=True, validators=[name_validator], help_text='Unique identifier used in URLs. 2-32 chars: lowercase letters, numbers, underscore. eg. /[name]')
     description = models.TextField(blank=True)
+    rules = JSONField(default=list, blank=True, help_text='List of community rules (array of strings).')
     created_by = models.ForeignKey(
         User,
         null=True,
         blank=True,
         on_delete=models.SET_NULL,
         related_name='created_communities',
+        limit_choices_to={
+            'role__in': [User.ROLE_SUPERUSER, User.ROLE_ADMIN]
+        }
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     last_activity = models.DateTimeField(auto_now=True)
+    
 
     class Meta:
         ordering = ['name']
