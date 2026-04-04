@@ -1,0 +1,18 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+  <h1>Set Status and Removal Reason</h1>
+  <form method="post">{% csrf_token %}
+    {{ form.as_p }}
+    <p>Are you sure you want to set the status and removal reason for the following threads/replies?</p>
+    {% for obj in items %}
+      <input type="hidden" name="_selected_action" value="{{ obj.pk }}" />
+      <p>- {{ obj }}</p>
+    {% endfor %}
+    <input type="hidden" name="apply" value="1" />
+    <span style="margin-left: 10px; color: red;">This action cannot be undone.</span>
+    <br /><br />
+    <input type="submit" value="Apply" class="default" />
+    <br /><br />
+    <a href="../">Cancel</a>
+  </form>
+{% endblock %}
