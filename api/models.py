@@ -4,9 +4,11 @@ from django.core.exceptions import ValidationError
 from django.core.validators import RegexValidator
 from django.contrib.postgres.fields import ArrayField
 from django.db.models import JSONField
+from django.db import connection
 from django.conf import settings
 from django.utils import timezone
 import hashlib
+import re
 import uuid
 
 # Create your models here.
@@ -119,6 +121,14 @@ class Community(models.Model):
     public_id = models.UUIDField(default=uuid.uuid4, editable=False, unique=True)
     title = models.CharField(max_length=120)
     name = models.CharField(max_length=32, unique=True, validators=[name_validator], help_text='Unique identifier used in URLs. 2-32 chars: lowercase letters, numbers, underscore. eg. /[name]')
+    schema_name = models.CharField(
+        max_length=63,
+        unique=True,
+        blank=True,
+        null=True,
+        editable=False,
+        help_text='PostgreSQL schema used for this community local forum tables.',
+    )
     description = models.TextField(blank=True)
     rules = JSONField(default=list, blank=True, help_text='List of community rules (array of strings).')
     created_by = models.ForeignKey(
@@ -144,9 +154,95 @@ class Community(models.Model):
         if self.created_by and not self.created_by.can_create_communities():
             raise ValidationError('Only admin or superuser can create communities.')
 
+    @staticmethod
+    def build_schema_name(community_name):
+        normalized = re.sub(r'[^a-z0-9_]', '_', community_name.lower()).strip('_')
+        normalized = normalized or 'community'
+        # PostgreSQL identifier max length is 63.
+        return f"community_{normalized}"[:63]
+
+    def ensure_forum_storage(self):
+        if connection.vendor != 'postgresql' or not self.schema_name:
+            return
+
+        qn = connection.ops.quote_name
+        schema = qn(self.schema_name)
+        thread_table = f"{schema}.{qn('threads')}"
+        reply_table = f"{schema}.{qn('replies')}"
+        community_table = qn(self._meta.db_table)
+        user_table = qn(User._meta.db_table)
+
+        with connection.cursor() as cursor:
+            cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
+            cursor.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {thread_table} (
+                    id BIGSERIAL PRIMARY KEY,
+                    community_id BIGINT NOT NULL REFERENCES {community_table}(id) ON DELETE CASCADE,
+                    author_id BIGINT NULL REFERENCES {user_table}(id) ON DELETE SET NULL,
+                    title VARCHAR(200) NOT NULL DEFAULT '',
+                    description TEXT NOT NULL DEFAULT '',
+                    image VARCHAR(255) NULL,
+                    adult_content BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    last_activity TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    status VARCHAR(32) NOT NULL DEFAULT 'public',
+                    removal_reason TEXT NOT NULL DEFAULT '',
+                    is_locked BOOLEAN NOT NULL DEFAULT FALSE,
+                    is_deleted BOOLEAN NOT NULL DEFAULT FALSE
+                )
+                """
+            )
+            cursor.execute(
+                f"""
+                CREATE TABLE IF NOT EXISTS {reply_table} (
+                    id BIGSERIAL PRIMARY KEY,
+                    thread_id BIGINT NOT NULL REFERENCES {thread_table}(id) ON DELETE CASCADE,
+                    author_id BIGINT NULL REFERENCES {user_table}(id) ON DELETE SET NULL,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    status VARCHAR(32) NOT NULL DEFAULT 'public',
+                    removal_reason TEXT NOT NULL DEFAULT '',
+                    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
+                    is_edited BOOLEAN NOT NULL DEFAULT FALSE
+                )
+                """
+            )
+            cursor.execute(
+                f"CREATE INDEX IF NOT EXISTS {qn('threads_community_created_idx')} ON {thread_table} (community_id, created_at DESC)"
+            )
+            cursor.execute(
+                f"CREATE INDEX IF NOT EXISTS {qn('replies_thread_created_idx')} ON {reply_table} (thread_id, created_at ASC)"
+            )
+
+    def drop_forum_storage(self):
+        if connection.vendor != 'postgresql' or not self.schema_name:
+            return
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"DROP SCHEMA IF EXISTS {connection.ops.quote_name(self.schema_name)} CASCADE"
+            )
+
     def save(self, *args, **kwargs):
+        is_new = self._state.adding
+        if is_new and not self.schema_name:
+            self.schema_name = self.build_schema_name(self.name)
+
         self.full_clean()
-        return super().save(*args, **kwargs)
+        result = super().save(*args, **kwargs)
+        if is_new:
+            self.ensure_forum_storage()
+        return result
+
+    def delete(self, *args, **kwargs):
+        schema_name = self.schema_name
+        result = super().delete(*args, **kwargs)
+        self.schema_name = schema_name
+        self.drop_forum_storage()
+        return result
 
     def __str__(self):
         return f"/{self.name} - {self.title}"
