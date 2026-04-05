@@ -2,7 +2,9 @@ from .models import Community, Thread, Reply, STATUS_PUBLIC
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
+from django.db import connection
 from django.db.models import Count, Q
+from django.http import Http404
 from django.shortcuts import get_object_or_404
 from rest_framework.decorators import api_view
 from rest_framework.decorators import authentication_classes, permission_classes
@@ -105,22 +107,75 @@ def community_list(request):
     ]
     return Response(data)
 
+def _community_forum_tables(community):
+    qn = connection.ops.quote_name
+    schema = qn(community.schema_name)
+    return f"{schema}.{qn('threads')}", f"{schema}.{qn('replies')}"
 
 @api_view(['GET'])
 def community_threads(request, name):
     community = get_object_or_404(Community, name=name)
-    threads = (
-        Thread.objects
-        .filter(community=community, status=STATUS_PUBLIC, is_deleted=False)
-        .select_related('author')
-        .annotate(
-            reply_count=Count(
-                'replies',
-                filter=Q(replies__status=STATUS_PUBLIC, replies__is_deleted=False),
+
+    if connection.vendor != 'postgresql':
+        threads = (
+            Thread.objects
+            .filter(community=community, status=STATUS_PUBLIC, is_deleted=False)
+            .select_related('author')
+            .annotate(
+                reply_count=Count(
+                    'replies',
+                    filter=Q(replies__status=STATUS_PUBLIC, replies__is_deleted=False),
+                )
             )
+            .order_by('-created_at')
         )
-        .order_by('-created_at')
-    )
+
+        return Response({
+            'community': {
+                'name': community.name,
+                'title': community.title,
+                'description': community.description,
+            },
+            'threads': [
+                {
+                    'id': t.id,
+                    'title': t.title,
+                    'description': t.description,
+                    'author': t.author.display_name if t.author else 'deleted-user',
+                    'created_at': t.created_at,
+                    'reply_count': t.reply_count,
+                }
+                for t in threads
+            ],
+        })
+
+    if not community.schema_name:
+        return Response({'detail': 'Community schema is not configured.'}, status=500)
+
+    thread_table, reply_table = _community_forum_tables(community)
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT
+                t.id,
+                t.title,
+                t.description,
+                t.created_at,
+                COALESCE(u.display_name, 'deleted-user') AS author,
+                COUNT(r.id) FILTER (WHERE r.status = %s AND r.is_deleted = FALSE) AS reply_count
+            FROM {thread_table} t
+            LEFT JOIN {reply_table} r ON r.thread_id = t.id
+            LEFT JOIN api_user u ON u.id = t.author_id
+            WHERE t.community_id = %s
+              AND t.status = %s
+              AND t.is_deleted = FALSE
+            GROUP BY t.id, t.title, t.description, t.created_at, u.display_name
+            ORDER BY t.created_at DESC
+            """,
+            [STATUS_PUBLIC, community.id, STATUS_PUBLIC],
+        )
+        rows = cursor.fetchall()
 
     return Response({
         'community': {
@@ -130,35 +185,106 @@ def community_threads(request, name):
         },
         'threads': [
             {
-                'id': t.id,
-                'title': t.title,
-                'description': t.description,
-                'author': t.author.display_name if t.author else 'deleted-user',
-                'created_at': t.created_at,
-                'reply_count': t.reply_count,
+                'id': row[0],
+                'title': row[1],
+                'description': row[2],
+                'created_at': row[3],
+                'author': row[4],
+                'reply_count': row[5],
             }
-            for t in threads
+            for row in rows
         ],
     })
-
 
 @api_view(['GET'])
 def thread_detail(request, name, thread_id):
     community = get_object_or_404(Community, name=name)
-    thread = get_object_or_404(
-        Thread.objects.select_related('author', 'community'),
-        id=thread_id,
-        community=community,
-        status=STATUS_PUBLIC,
-        is_deleted=False,
-    )
 
-    replies = (
-        Reply.objects
-        .filter(thread=thread, status=STATUS_PUBLIC, is_deleted=False)
-        .select_related('author')
-        .order_by('created_at')
-    )
+    if connection.vendor != 'postgresql':
+        thread = get_object_or_404(
+            Thread.objects.select_related('author', 'community'),
+            id=thread_id,
+            community=community,
+            status=STATUS_PUBLIC,
+            is_deleted=False,
+        )
+
+        replies = (
+            Reply.objects
+            .filter(thread=thread, status=STATUS_PUBLIC, is_deleted=False)
+            .select_related('author')
+            .order_by('created_at')
+        )
+
+        return Response({
+            'community': {
+                'name': community.name,
+                'title': community.title,
+            },
+            'thread': {
+                'id': thread.id,
+                'title': thread.title,
+                'description': thread.description,
+                'author': thread.author.display_name if thread.author else 'deleted-user',
+                'created_at': thread.created_at,
+            },
+            'replies': [
+                {
+                    'id': reply.id,
+                    'content': reply.content,
+                    'author': reply.author.display_name if reply.author else 'deleted-user',
+                    'created_at': reply.created_at,
+                }
+                for reply in replies
+            ],
+        })
+
+    if not community.schema_name:
+        return Response({'detail': 'Community schema is not configured.'}, status=500)
+
+    thread_table, reply_table = _community_forum_tables(community)
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            f"""
+            SELECT
+                t.id,
+                t.title,
+                t.description,
+                t.created_at,
+                COALESCE(u.display_name, 'deleted-user') AS author
+            FROM {thread_table} t
+            LEFT JOIN api_user u ON u.id = t.author_id
+            WHERE t.id = %s
+              AND t.community_id = %s
+              AND t.status = %s
+              AND t.is_deleted = FALSE
+            LIMIT 1
+            """,
+            [thread_id, community.id, STATUS_PUBLIC],
+        )
+        thread_row = cursor.fetchone()
+
+        if not thread_row:
+            raise Http404
+
+        cursor.execute(
+            f"""
+            SELECT
+                r.id,
+                r.content,
+                r.created_at,
+                COALESCE(u.display_name, 'deleted-user') AS author
+            FROM {reply_table} r
+            LEFT JOIN api_user u ON u.id = r.author_id
+            WHERE r.thread_id = %s
+              AND r.status = %s
+              AND r.is_deleted = FALSE
+            ORDER BY r.created_at ASC
+            """,
+            [thread_id, STATUS_PUBLIC],
+        )
+        reply_rows = cursor.fetchall()
 
     return Response({
         'community': {
@@ -166,19 +292,19 @@ def thread_detail(request, name, thread_id):
             'title': community.title,
         },
         'thread': {
-            'id': thread.id,
-            'title': thread.title,
-            'description': thread.description,
-            'author': thread.author.display_name if thread.author else 'deleted-user',
-            'created_at': thread.created_at,
+            'id': thread_row[0],
+            'title': thread_row[1],
+            'description': thread_row[2],
+            'created_at': thread_row[3],
+            'author': thread_row[4],
         },
         'replies': [
             {
-                'id': reply.id,
-                'content': reply.content,
-                'author': reply.author.display_name if reply.author else 'deleted-user',
-                'created_at': reply.created_at,
+                'id': row[0],
+                'content': row[1],
+                'created_at': row[2],
+                'author': row[3],
             }
-            for reply in replies
+            for row in reply_rows
         ],
     })
