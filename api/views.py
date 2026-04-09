@@ -10,8 +10,10 @@ from rest_framework.decorators import api_view
 from rest_framework.decorators import authentication_classes, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework import status
 
 from rest_framework_simplejwt.tokens import RefreshToken
+from rest_framework_simplejwt.exceptions import TokenError
 from rest_framework.views import APIView
 from rest_framework.permissions import AllowAny
 import secrets
@@ -69,6 +71,23 @@ class RegisterKeyView(APIView):
             'display_name': user.display_name,
         }, status=201)
 
+
+class RefreshJWTView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        refresh_token = request.data.get('refresh')
+        if not refresh_token:
+            return Response({'detail': 'Refresh token required.'}, status=400)
+
+        try:
+            refresh = RefreshToken(refresh_token)
+            access = str(refresh.access_token)
+        except TokenError:
+            return Response({'detail': 'Refresh token is invalid or expired.'}, status=401)
+
+        return Response({'access': access})
+
 @api_view(['GET'])
 def pow_config(request):
     difficulty = int(getattr(settings, 'POW_DIFFICULTY', 4))
@@ -112,9 +131,68 @@ def _community_forum_tables(community):
     schema = qn(community.schema_name)
     return f"{schema}.{qn('threads')}", f"{schema}.{qn('replies')}"
 
-@api_view(['GET'])
+@api_view(['GET', 'POST'])
 def community_threads(request, name):
     community = get_object_or_404(Community, name=name)
+
+    if request.method == 'POST':
+        if not request.user or not request.user.is_authenticated:
+            return Response({'detail': 'Authentication required.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        title = (request.data.get('title') or '').strip()
+        description = (request.data.get('description') or '').strip()
+
+        if not title and not description:
+            return Response(
+                {'detail': 'Either title or description is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if connection.vendor != 'postgresql':
+            thread = Thread.objects.create(
+                community=community,
+                author=request.user,
+                title=title,
+                description=description,
+            )
+            return Response(
+                {
+                    'id': thread.id,
+                    'title': thread.title,
+                    'description': thread.description,
+                    'author': thread.author.display_name if thread.author else 'deleted-user',
+                    'created_at': thread.created_at,
+                    'reply_count': 0,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+
+        if not community.schema_name:
+            return Response({'detail': 'Community schema is not configured.'}, status=500)
+
+        thread_table, _ = _community_forum_tables(community)
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                INSERT INTO {thread_table} (community_id, author_id, title, description)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id, title, description, created_at
+                """,
+                [community.id, request.user.id, title, description],
+            )
+            created_row = cursor.fetchone()
+
+        return Response(
+            {
+                'id': created_row[0],
+                'title': created_row[1],
+                'description': created_row[2],
+                'created_at': created_row[3],
+                'author': request.user.display_name,
+                'reply_count': 0,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
     if connection.vendor != 'postgresql':
         threads = (
@@ -196,9 +274,97 @@ def community_threads(request, name):
         ],
     })
 
-@api_view(['GET'])
+@api_view(['GET', 'POST'])
 def thread_detail(request, name, thread_id):
     community = get_object_or_404(Community, name=name)
+
+    if request.method == 'POST':
+        if not request.user or not request.user.is_authenticated:
+            return Response({'detail': 'Authentication required.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+        content = (request.data.get('content') or '').strip()
+        if not content:
+            return Response({'detail': 'Reply content is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if connection.vendor != 'postgresql':
+            thread = get_object_or_404(
+                Thread,
+                id=thread_id,
+                community=community,
+                status=STATUS_PUBLIC,
+                is_deleted=False,
+            )
+            if thread.is_locked:
+                return Response({'detail': 'This thread is locked.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            reply = Reply.objects.create(thread=thread, author=request.user, content=content)
+            thread.last_activity = reply.created_at
+            thread.save(update_fields=['last_activity', 'updated_at'])
+
+            return Response(
+                {
+                    'id': reply.id,
+                    'content': reply.content,
+                    'author': reply.author.display_name if reply.author else 'deleted-user',
+                    'created_at': reply.created_at,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+
+        if not community.schema_name:
+            return Response({'detail': 'Community schema is not configured.'}, status=500)
+
+        thread_table, reply_table = _community_forum_tables(community)
+
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"""
+                SELECT is_locked
+                FROM {thread_table}
+                WHERE id = %s
+                  AND community_id = %s
+                  AND status = %s
+                  AND is_deleted = FALSE
+                LIMIT 1
+                """,
+                [thread_id, community.id, STATUS_PUBLIC],
+            )
+            thread_row = cursor.fetchone()
+
+            if not thread_row:
+                raise Http404
+
+            if thread_row[0]:
+                return Response({'detail': 'This thread is locked.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            cursor.execute(
+                f"""
+                INSERT INTO {reply_table} (thread_id, author_id, content)
+                VALUES (%s, %s, %s)
+                RETURNING id, content, created_at
+                """,
+                [thread_id, request.user.id, content],
+            )
+            reply_row = cursor.fetchone()
+
+            cursor.execute(
+                f"""
+                UPDATE {thread_table}
+                SET last_activity = NOW(), updated_at = NOW()
+                WHERE id = %s
+                """,
+                [thread_id],
+            )
+
+        return Response(
+            {
+                'id': reply_row[0],
+                'content': reply_row[1],
+                'created_at': reply_row[2],
+                'author': request.user.display_name,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 
     if connection.vendor != 'postgresql':
         thread = get_object_or_404(
