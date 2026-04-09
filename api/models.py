@@ -113,6 +113,8 @@ class User(AbstractBaseUser, PermissionsMixin):
         }
 
 class Community(models.Model):
+    RESERVED_NAMES = {'about', 'support', 'u'}
+
     name_validator = RegexValidator(
         regex=r'^[a-z0-9_]{2,32}$',
         message='Community name must be 2-32 chars: lowercase letters, numbers, underscore.',
@@ -151,9 +153,12 @@ class Community(models.Model):
         verbose_name_plural = 'Communities'
 
     def clean(self):
+        if self.name and self.name.strip().lower() in self.RESERVED_NAMES:
+            raise ValidationError({'name': 'This community name is reserved and cannot be used.'})
+
         if self.created_by and not self.created_by.can_create_communities():
             raise ValidationError('Only admin or superuser can create communities.')
-
+    
     @staticmethod
     def build_schema_name(community_name):
         normalized = re.sub(r'[^a-z0-9_]', '_', community_name.lower()).strip('_')

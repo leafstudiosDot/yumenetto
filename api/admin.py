@@ -3,9 +3,7 @@
 from django import forms
 from django.contrib import admin
 from django.contrib.admin import helpers
-from django.shortcuts import render, redirect
-from django.urls import path
-from django.utils.html import format_html
+from django.shortcuts import render
 
 # Set custom admin site titles
 admin.site.site_header = 'YumeNetto Admin'
